@@ -178,6 +178,19 @@ static void llama_tensor_dequantize_impl(
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_type, const ggml_tensor * tensor, llama_ftype ftype) {
     const std::string name = ggml_get_name(tensor);
 
+    // Handle --quantize-qkv-only flag
+    if (qs.params->only_quantize_qkv) {
+        // Only quantize attention Q, K, V weights
+        const bool is_qkv = (name.find("attn_q.weight") != std::string::npos ||
+                             name.find("attn_k.weight") != std::string::npos ||
+                             name.find("attn_v.weight") != std::string::npos ||
+                             name.find("attn_qkv.weight") != std::string::npos);
+        if (!is_qkv) {
+            // Keep original type for non-QKV tensors
+            return tensor->type;
+        }
+    }
+
     // TODO: avoid hardcoded tensor names - use the TN_* constants
     const llm_arch arch = qs.model.arch;
     const auto       tn = LLM_TN(arch);
@@ -544,6 +557,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         case LLAMA_FTYPE_MOSTLY_BF16: default_type = GGML_TYPE_BF16; break;
         case LLAMA_FTYPE_ALL_F32:     default_type = GGML_TYPE_F32;  break;
 
+        case LLAMA_FTYPE_MOSTLY_Q_FP8_E4M3FN: default_type = GGML_TYPE_Q_FP8_E4M3FN; break;
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: default_type = GGML_TYPE_MXFP4; break;
 
         // K-quants
@@ -1069,6 +1083,7 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.only_copy                   =*/ false,
         /*.pure                        =*/ false,
         /*.keep_split                  =*/ false,
+        /*.only_quantize_qkv           =*/ false,
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,

@@ -21,6 +21,63 @@
 
 #define UNUSED GGML_UNUSED
 
+// Convert float to FP8 E4M3FN format
+// FP8 E4M3FN: 1 sign bit, 4 exponent bits (bias 7), 3 mantissa bits
+// Range: ±448, No infinities, NaN = 0x7F
+static inline uint8_t float_to_fp8_e4m3fn(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(f));
+
+    uint32_t sign = (bits >> 31) & 0x1;
+    int32_t exp = ((bits >> 23) & 0xFF) - 127;  // Remove FP32 bias
+    uint32_t mant = (bits >> 20) & 0x7;  // Take top 3 bits of FP32 mantissa
+
+    // Handle special cases
+    if (exp < -10) return (sign << 7);  // Zero
+    if (exp > 8) return (sign << 7) | 0x7E;  // Max normal value (~448)
+
+    // Adjust exponent to FP8 bias (7) and handle subnormals
+    if (exp < -6) {
+        // Subnormal in FP8
+        mant = (mant | 0x8) >> (-6 - exp);  // Add implicit 1, shift
+        exp = 0;
+    } else {
+        exp = exp + 7;  // Add FP8 bias
+    }
+
+    return (sign << 7) | ((exp & 0xF) << 3) | (mant & 0x7);
+}
+
+// Convert FP8 E4M3FN to float
+static inline float fp8_e4m3fn_to_float(uint8_t x) {
+    uint32_t sign = (x >> 7) & 0x1;
+    uint32_t exp = (x >> 3) & 0xF;
+    uint32_t mant = x & 0x7;
+
+    // Handle special cases
+    if (exp == 0) {
+        // Zero or subnormal
+        if (mant == 0) {
+            uint32_t bits = sign << 31;
+            float result;
+            memcpy(&result, &bits, sizeof(result));
+            return result;
+        }
+        // Subnormal: (-1)^sign * 2^(-6) * (0.mant)
+        float val = (mant / 8.0f) * powf(2.0f, -6.0f);
+        return sign ? -val : val;
+    }
+
+    if (exp == 15 && mant == 7) {
+        // NaN
+        return NAN;
+    }
+
+    // Normal numbers: (-1)^sign * 2^(exp - 7) * (1.mant)
+    float val = (1.0f + mant / 8.0f) * powf(2.0f, (int)exp - 7);
+    return sign ? -val : val;
+}
+
 static inline int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
     if (x >= val[n-1]) return n-1;
@@ -255,6 +312,65 @@ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_REST
 
         y[i].s = GGML_FP32_TO_FP16(sum*d);
     }
+}
+
+// reference implementation for deterministic creation of model files
+void quantize_row_q_fp8_e4m3fn_ref(const float * GGML_RESTRICT x, block_q_fp8_e4m3fn * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_FP8_E4M3FN == 0);
+    const int nb = k / QK_FP8_E4M3FN;
+
+    // Per-tensor symmetric quantization: find global max absolute value
+    float max_abs = 0.0f;
+    for (int64_t i = 0; i < k; i++) {
+        const float v = fabsf(x[i]);
+        if (v > max_abs) max_abs = v;
+    }
+
+    // Compute per-tensor scale (symmetric, centered at 0)
+    // FP8 E4M3FN symmetric range: [-448, 448]
+    const float scale = max_abs / 448.0f;
+    const float inv_scale = scale > 0.0f ? (1.0f / scale) : 0.0f;
+
+    // Store per-tensor scale in first block (all blocks share the same scale)
+    const ggml_fp16_t scale_fp16 = GGML_FP32_TO_FP16(scale);
+
+    // Quantize all values using the same per-tensor scale
+    for (int i = 0; i < nb; i++) {
+        // All blocks have the same scale
+        y[i].d = scale_fp16;
+
+        // Quantize block values (symmetric, centered at 0)
+        for (int j = 0; j < QK_FP8_E4M3FN; j++) {
+            const float v = x[i * QK_FP8_E4M3FN + j];
+            const float normalized = v * inv_scale;  // Range: [-448, 448]
+            y[i].qs[j] = float_to_fp8_e4m3fn(normalized);
+        }
+    }
+}
+
+void quantize_row_q_fp8_e4m3fn(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q_fp8_e4m3fn_ref(x, (block_q_fp8_e4m3fn *)y, k);
+}
+
+void dequantize_row_q_fp8_e4m3fn(const block_q_fp8_e4m3fn * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_FP8_E4M3FN == 0);
+    const int nb = k / QK_FP8_E4M3FN;
+    for (int i = 0; i < nb; i++) {
+        // Per-tensor scale (symmetric, no offset)
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < QK_FP8_E4M3FN; j++) {
+            // Convert FP8 E4M3FN (stored as uint8) to float
+            const float q_val = fp8_e4m3fn_to_float(x[i].qs[j]);
+            // Apply symmetric dequantization formula: y = qs * d (no offset)
+            y[i * QK_FP8_E4M3FN + j] = q_val * d;
+        }
+    }
+}
+
+size_t quantize_q_fp8_e4m3fn(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    UNUSED(quant_weights);  // FP8 doesn't use importance matrix
+    quantize_row_q_fp8_e4m3fn_ref(src, dst, (int64_t)nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q_FP8_E4M3FN, n_per_row);
 }
 
 static inline int best_index_mxfp4(float x, float e) {
@@ -5306,6 +5422,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_IQ4_NL:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
+            } break;
+        case GGML_TYPE_Q_FP8_E4M3FN:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q_fp8_e4m3fn, data, nb);
             } break;
 
         case GGML_TYPE_I8:

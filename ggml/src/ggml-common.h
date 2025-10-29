@@ -236,6 +236,15 @@ typedef struct {
 } block_q8_1;
 static_assert(sizeof(block_q8_1) == 2*sizeof(ggml_half) + QK8_1, "wrong q8_1 block size/padding");
 
+// FP8 E4M3FN per-tensor symmetric quantization (scale-only, no offset)
+// Block size = 1 (per-tensor scale), but we use QK_FP8_E4M3FN for data layout compatibility
+#define QK_FP8_E4M3FN 32
+typedef struct {
+    ggml_half d;                    // delta (scale), per-tensor symmetric
+    uint8_t qs[QK_FP8_E4M3FN];      // fp8 e4m3fn values stored as uint8
+} block_q_fp8_e4m3fn;
+static_assert(sizeof(block_q_fp8_e4m3fn) == sizeof(ggml_half) + QK_FP8_E4M3FN, "wrong q_fp8_e4m3fn block size/padding");
+
 //
 // Ternary quantization
 //
